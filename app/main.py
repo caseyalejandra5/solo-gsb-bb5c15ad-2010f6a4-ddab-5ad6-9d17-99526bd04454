@@ -10,8 +10,9 @@ from .schemas import PlanRequest
 
 app = FastAPI(
     title="冷链装箱温控规划器 API",
-    description="按温区兼容与容量约束生成冷链分箱方案,支持分段运输逐段温区校验",
-    version="1.1.0",
+    description="按温区兼容与容量约束生成冷链分箱方案,支持分段运输逐段温区校验"
+    "与累计热暴露(度时)预算",
+    version="1.2.0",
 )
 
 

@@ -46,12 +46,13 @@ const SAMPLE = {
     },
   ],
   cargoes: [
-    { name: "三文鱼刺身", units: 18, unit_volume: 0.4, t_min: -2, t_max: 2, max_transport_hours: 36 },
-    { name: "巴氏鲜奶", units: 40, unit_volume: 0.25, t_min: 2, t_max: 6, max_transport_hours: "" },
+    { name: "三文鱼刺身", units: 18, unit_volume: 0.4, t_min: -2, t_max: 2, preferred_t_min: -1, preferred_t_max: 1, max_degree_hours: 30, max_transport_hours: 36 },
+    { name: "巴氏鲜奶", units: 40, unit_volume: 0.25, t_min: 2, t_max: 6, preferred_t_min: 3, preferred_t_max: 5, max_degree_hours: 20, max_transport_hours: "" },
     { name: "冷冻牛排", units: 30, unit_volume: 0.8, t_min: -22, t_max: -15, max_transport_hours: "" },
     { name: "冰淇淋", units: 24, unit_volume: 0.5, t_min: -28, t_max: -18, max_transport_hours: 48 },
     { name: "冷冻饺子", units: 26, unit_volume: 0.6, t_min: -18, t_max: -5, max_transport_hours: "" },
-    { name: "鲜切水果", units: 20, unit_volume: 0.3, t_min: 2, t_max: 8, max_transport_hours: 20 },
+    { name: "鲜切水果", units: 20, unit_volume: 0.3, t_min: 2, t_max: 8, preferred_t_min: 3, preferred_t_max: 6, max_degree_hours: 15, max_transport_hours: "" },
+    { name: "熟成奶酪(预算不足)", units: 6, unit_volume: 0.5, t_min: 2, t_max: 18, preferred_t_min: 12, preferred_t_max: 16, max_degree_hours: 40, max_transport_hours: "" },
     { name: "温控疫苗", units: 12, unit_volume: 0.15, t_min: 2, t_max: 8, max_transport_hours: 12 },
     { name: "巧克力", units: 30, unit_volume: 0.2, t_min: 15, t_max: 22, max_transport_hours: "" },
     { name: "热带水果(温区缺失)", units: 10, unit_volume: 0.4, t_min: 10, t_max: 14, max_transport_hours: "" },
@@ -141,6 +142,9 @@ function addCargoRow(c = {}) {
     zoneCell(c.unit_volume ?? "", "单件体积", "number"),
     zoneCell(c.t_min ?? "", "下限", "number"),
     zoneCell(c.t_max ?? "", "上限", "number"),
+    zoneCell(c.preferred_t_min ?? "", "首选下限", "number"),
+    zoneCell(c.preferred_t_max ?? "", "首选上限", "number"),
+    `<input type="number" step="any" min="0" value="${c.max_degree_hours ?? ""}" placeholder="不限" />`,
     `<input type="number" step="any" min="0" value="${c.max_transport_hours ?? ""}" placeholder="不限" />`,
     '<button type="button" class="btn btn-del">删除</button>',
   ]);
@@ -221,16 +225,22 @@ function collectInput() {
   const zones = useSeg ? [] : readZones($("zoneRows"));
   const segments = useSeg ? collectSegments() : [];
 
-  const cargoes = readRows($("cargoRows"), 6, [
+  const cargoes = readRows($("cargoRows"), 9, [
     { key: "name", label: "名称" },
     { key: "units", label: "件数", numeric: true },
     { key: "unit_volume", label: "单件体积", numeric: true },
     { key: "t_min", label: "温度下限", numeric: true },
     { key: "t_max", label: "温度上限", numeric: true },
+    { key: "preferred_t_min", label: "首选温度下限", numeric: false },
+    { key: "preferred_t_max", label: "首选温度上限", numeric: false },
+    { key: "max_degree_hours", label: "度时预算", numeric: false },
     { key: "max_transport_hours", label: "最长运输时长", numeric: false },
   ]).map((c, i) => ({
     ...c,
     name: c.name || `批次 ${i + 1}`,
+    preferred_t_min: c.preferred_t_min === "" ? null : Number(c.preferred_t_min),
+    preferred_t_max: c.preferred_t_max === "" ? null : Number(c.preferred_t_max),
+    max_degree_hours: c.max_degree_hours === "" ? null : Number(c.max_degree_hours),
     max_transport_hours: c.max_transport_hours === "" ? null : Number(c.max_transport_hours),
   }));
 
@@ -240,6 +250,15 @@ function collectInput() {
     if (c.units <= 0) throw new Error(`货物「${c.name}」件数必须大于 0`);
     if (c.unit_volume <= 0) throw new Error(`货物「${c.name}」单件体积必须大于 0`);
     if (c.t_min > c.t_max) throw new Error(`货物「${c.name}」温度下限不能高于上限`);
+    if ((c.preferred_t_min === null) !== (c.preferred_t_max === null))
+      throw new Error(`货物「${c.name}」的首选温度区间需同时填写下限和上限`);
+    if (c.preferred_t_min !== null && c.preferred_t_min > c.preferred_t_max)
+      throw new Error(`货物「${c.name}」首选温度下限不能高于上限`);
+    if (c.max_degree_hours !== null) {
+      if (c.max_degree_hours < 0) throw new Error(`货物「${c.name}」度时预算不能为负`);
+      if (c.preferred_t_min === null)
+        throw new Error(`货物「${c.name}」填写了度时预算,请同时填写首选温度区间`);
+    }
     if (c.max_transport_hours !== null && c.max_transport_hours < 0)
       throw new Error(`货物「${c.name}」最长运输时长不能为负`);
   }
@@ -303,6 +322,49 @@ function renderSegmentChecks(box) {
     </table>`;
 }
 
+/* 各批累计热暴露与度时预算核算表(箱内无预算批次时不渲染) */
+function renderHeatExposure(box) {
+  const entries = box.heat_exposure || [];
+  if (!entries.some((e) => e.max_degree_hours !== null)) return "";
+  const rows = entries
+    .map((e) => {
+      const pref =
+        e.preferred_t_min !== null
+          ? `${fmt(e.preferred_t_min)}~${fmt(e.preferred_t_max)}℃`
+          : "—";
+      const show = (v) => (v !== null ? fmt(v) : "—");
+      let status, bar = "";
+      if (e.max_degree_hours === null) {
+        status = '<span class="muted">未设预算</span>';
+      } else if (e.exceeded) {
+        status = `<span class="heat-text-bad">⚠ 第 ${e.first_exceeded_segment_no} 段超限</span>`;
+      } else {
+        status = '<span class="heat-text-ok">✓ 预算内</span>';
+      }
+      if (e.usage_ratio !== null) {
+        const pct = Math.min(100, Math.round(e.usage_ratio * 100));
+        const cls = e.exceeded ? "heat-bad" : e.usage_ratio >= 0.7 ? "heat-warn" : "heat-ok";
+        bar = `<div class="heat-bar" title="使用率 ${pct}%"><i class="${cls}" style="width:${pct}%"></i></div>`;
+      }
+      return `<tr>
+        <td>#${e.batch_no} ${escapeHtml(e.name)}</td>
+        <td class="num">${pref}</td>
+        <td class="num">${show(e.cumulative_exposure)}</td>
+        <td class="num">${show(e.max_degree_hours)}</td>
+        <td class="num">${show(e.remaining_budget)}</td>
+        <td>${bar}${status}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <table class="seg-checks heat-table">
+      <thead><tr><th>热暴露核算(批次)</th><th class="num">首选区间</th>
+        <th class="num">累计暴露 ℃·h</th><th class="num">预算 ℃·h</th>
+        <th class="num">剩余预算 ℃·h</th><th>使用率 / 状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 function renderBox(box, unit, segmentMode) {
   const segText = fmtSegs(box.temperature_segments);
   const items = box.items
@@ -318,6 +380,11 @@ function renderBox(box, unit, segmentMode) {
   const transportBadge = box.transportable
     ? '<span class="badge badge-ok">✓ 全程可运输</span>'
     : '<span class="badge badge-bad">⚠ 分段不兼容</span>';
+  const heatNote = (box.heat_exposure || []).some((e) => e.max_degree_hours !== null)
+    ? ` · 热暴露: <strong class="${box.heat_exposure_ok ? "heat-text-ok" : "heat-text-bad"}">${
+        box.heat_exposure_ok ? "✓ 全部批次预算内" : "⚠ 存在超限批次"
+      }</strong>`
+    : "";
   const card = document.createElement("div");
   card.className = "box-card";
   card.innerHTML = `
@@ -329,10 +396,11 @@ function renderBox(box, unit, segmentMode) {
     <div class="meta-line">
       推荐设定温度 <strong>${fmt(box.recommended_setpoint)}℃</strong> ·
       匹配温区: ${box.matched_zones.map(escapeHtml).join("、")} ·
-      容量 ${fmt(box.used_volume)} / ${fmt(box.capacity)} ${unit}（${pct}%）
+      容量 ${fmt(box.used_volume)} / ${fmt(box.capacity)} ${unit}（${pct}%）${heatNote}
     </div>
     <div class="cap-bar"><i style="width:${pct}%"></i></div>
     ${segmentMode ? renderSegmentChecks(box) : ""}
+    ${renderHeatExposure(box)}
     <table class="items">
       <thead><tr><th>装载批次</th><th class="num">件数</th><th class="num">占用体积</th></tr></thead>
       <tbody>${items}</tbody>
@@ -352,10 +420,13 @@ function renderUnloaded(unloaded, unit) {
     const segBadge = u.failed_segment_name
       ? `<span class="seg-badge">首次不兼容:第 ${u.failed_segment_no} 段 · ${escapeHtml(u.failed_segment_name)}</span>`
       : "";
+    const heatBadge = u.first_exceeded_segment_name
+      ? `<span class="seg-badge">首次超限:第 ${u.first_exceeded_segment_no} 段 · ${escapeHtml(u.first_exceeded_segment_name)}</span>`
+      : "";
     const div = document.createElement("div");
     div.className = "unloaded-item";
     div.innerHTML = `
-      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}</div>
+      <div class="u-title">⛔ #${u.batch_no} ${escapeHtml(u.name)} — 未能装载 ${fmt(u.units)} 件（${fmt(u.volume)} ${unit}）${segBadge}${heatBadge}</div>
       <div class="u-reason">原因：${escapeHtml(u.reason)}</div>`;
     wrap.appendChild(div);
   });

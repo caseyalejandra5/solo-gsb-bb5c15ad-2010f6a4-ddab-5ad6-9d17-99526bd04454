@@ -310,6 +310,25 @@ table.seg-checks tr.seg-ok td:first-child { color: var(--ok); font-weight: 700; 
 table.seg-checks tr.seg-bad td { background: var(--err-bg); }
 table.seg-checks tr.seg-bad td:first-child { color: var(--err); font-weight: 700; }
 
+/* ---------- 热暴露预算 ---------- */
+.heat-table { margin-top: 10px; }
+.heat-bar {
+  display: inline-block;
+  width: 90px;
+  height: 6px;
+  background: #dde7f0;
+  border-radius: 4px;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+.heat-bar > i { display: block; height: 100%; }
+.heat-bar > i.heat-ok { background: linear-gradient(90deg, #35b06f, var(--ok)); }
+.heat-bar > i.heat-warn { background: linear-gradient(90deg, #e0a63c, #c07f00); }
+.heat-bar > i.heat-bad { background: linear-gradient(90deg, #d95940, var(--err)); }
+.heat-text-ok { color: var(--ok); font-weight: 600; }
+.heat-text-bad { color: var(--err); font-weight: 600; }
+
 .error-box {
   margin-top: 14px;
   border: 1px solid #f0cdc9;
