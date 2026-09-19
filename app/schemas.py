@@ -22,10 +22,22 @@ class CargoIn(BaseModel):
     name: str = Field(..., description="货物批次名称")
     units: int = Field(..., gt=0, description="件数(拆分的最小单位)")
     unit_volume: float = Field(..., gt=0, description="单件占用体积")
-    t_min: float = Field(..., description="允许温度下限 ℃")
-    t_max: float = Field(..., description="允许温度上限 ℃")
+    t_min: float = Field(..., description="允许温度下限 ℃(硬边界)")
+    t_max: float = Field(..., description="允许温度上限 ℃(硬边界)")
     max_transport_hours: float | None = Field(
         None, ge=0, description="该批货物可承受的最长运输时长(小时),留空表示不限"
+    )
+    preferred_t_min: float | None = Field(
+        None,
+        description="首选温度下限 ℃;需与首选上限成对填写且落在允许温区内,"
+        "留空表示无偏好",
+    )
+    preferred_t_max: float | None = Field(None, description="首选温度上限 ℃")
+    max_degree_hours: float | None = Field(
+        None,
+        ge=0,
+        description="最大热暴露度时预算(℃·h);启用时需先填写首选温度区间,"
+        "留空或 0 表示不启用预算约束",
     )
 
 

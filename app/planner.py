@@ -8,6 +8,13 @@
 - 支持分段运输:按顺序维护若干运输段(名称/时长/可用温区),箱内货物的
   共同允许温度必须在每一段都能被该段某个温区覆盖,否则报告首次不兼容的
   运输段;只有全程通过才标记为可运输。未提供运输段时退化为全程单一温区。
+- 累计热暴露预算:货物可额外填写首选温度区间与最大度时预算(℃·h),
+  允许温区仍作为硬边界。规划器为每个箱子逐段选取一个同时落在箱内货物
+  共同允许温区与该段某可用温区内的设定点;单段暴露量 = 段时长 × 设定点
+  到该批首选区间的距离。每段从"该段可行区间端点 + 箱内各批首选区间端点"
+  中选取使本段结束后箱内最大累计预算使用率最低的点,平局取较低温度;
+  任何货物累计超预算则该装箱组合不可用。未填写预算的批次保持原规则
+  (设定点取最宽可行区间中点,不参与预算约束)。
 - 同一批货物可按"件"为最小单位拆分到多个箱子。
 - 采用 First-Fit-Decreasing 启发式:温度下限越低(要求越苛刻)的批次优先,
   同温限按总体积降序;依次塞入已有箱子,放不下再开新箱。
@@ -42,6 +49,15 @@ class _Iv:
 class _Zone:
     name: str
     iv: _Iv
+
+
+def _dist_to_iv(t: float, iv: _Iv) -> float:
+    """温度 t 到闭区间的距离(区间内为 0)。"""
+    if t < iv.lo:
+        return iv.lo - t
+    if t > iv.hi:
+        return t - iv.hi
+    return 0.0
 
 
 @dataclass
@@ -79,6 +95,8 @@ class _Box:
     items: list[_Loaded] = field(default_factory=list)
     # 已装入货物允许温区的交集;首件货物装入时初始化
     feasible: _Iv | None = None
+    # 箱内批次(按批次号去重),用于热暴露模拟
+    batch_map: dict[int, "_Batch"] = field(default_factory=dict)
 
     def try_load(self, batch: "_Batch", iv: _Iv) -> bool:
         """尝试装入 1 件货物,成功则更新箱内温度交集与容量。"""
@@ -89,6 +107,11 @@ class _Box:
             return False
         # 交集后的温度必须在每个运输段都至少能被该段一个温区覆盖
         if _first_failed_segment(self.segments, new_feasible) is not None:
+            return False
+        # 新批次会收窄可行区间,需重验箱内热暴露预算;同批已在箱内时结论不变
+        if batch.no not in self.batch_map and not self._exposure_ok(
+            new_feasible, batch
+        ):
             return False
         if self.items and self.items[-1].batch_no == batch.no:
             self.items[-1].units += 1
@@ -102,16 +125,24 @@ class _Box:
                     volume=batch.unit_volume,
                 )
             )
+        self.batch_map[batch.no] = batch
         self.used = _r(self.used + batch.unit_volume)
         self.feasible = new_feasible
         return True
 
-    def can_take(self, iv: _Iv) -> bool:
-        """该箱是否在温区上能容纳此温度区间的货物(不考虑剩余容量)。"""
+    def _exposure_ok(self, feasible: _Iv, extra: "_Batch") -> bool:
+        """在箱内加入 extra 批次后,所有含预算批次的累计暴露均不超限。"""
+        batches = list(self.batch_map.values())
+        if extra.budget is None and all(b.budget is None for b in batches):
+            return True
+        return _simulate_exposure(self.segments, feasible, [*batches, extra])["ok"]
+
+    def can_take(self, batch: "_Batch", iv: _Iv) -> bool:
+        """该箱是否在温区与热暴露预算上能容纳此批货物(不考虑剩余容量)。"""
         candidate = iv if self.feasible is None else self.feasible.intersect(iv)
-        return candidate is not None and _first_failed_segment(
-            self.segments, candidate
-        ) is None
+        if candidate is None or _first_failed_segment(self.segments, candidate) is not None:
+            return False
+        return batch.no in self.batch_map or self._exposure_ok(candidate, batch)
 
 
 @dataclass
@@ -122,6 +153,8 @@ class _Batch:
     unit_volume: float
     iv: _Iv
     max_hours: float | None
+    pref: _Iv | None  # 首选温度区间(可选);暴露量按设定点到该区间距离计量
+    budget: float | None  # 最大度时预算 ℃·h(可选,需配合首选区间)
     total_volume: float
 
 
@@ -142,6 +175,79 @@ def _merge_segments(segs: list[_Iv]) -> list[_Iv]:
         else:
             merged.append(_Iv(s.lo, s.hi))
     return merged
+
+
+def _simulate_exposure(
+    segments: list[_Segment], feasible: _Iv, batches: list[_Batch]
+) -> dict[str, Any]:
+    """对给定装箱组合逐段选取设定点并累计各批热暴露。
+
+    每段设定点必须落在 "箱内共同允许温区 ∩ 该段某可用温区" 内;候选点为
+    该段各可行区间的端点与箱内各批首选区间端点(落在可行区间内的),逐一
+    评估"本段结束后箱内最大累计预算使用率",取最低者,平局取较低温度。
+    箱内无任何预算批次时沿用原规则:取最宽可行区间的中点。
+    返回各段设定点、各批(填写了首选区间的)累计暴露与首次超限段。
+    """
+    tracked = [b for b in batches if b.pref is not None]
+    budgeted = [b for b in tracked if b.budget is not None]
+    cum: dict[int, float] = {b.no: 0.0 for b in tracked}
+    # 批次号 -> (首次超限的运输段, 该段结束时的累计暴露)
+    first_exceeded: dict[int, tuple[_Segment, float]] = {}
+    setpoints: dict[int, float | None] = {}
+    for seg in segments:
+        merged = _merge_segments(
+            [s for z in seg.zones if (s := feasible.intersect(z.iv)) is not None]
+        )
+        if not merged:
+            # 该段温区无可行温度(装载前已逐段预检,此处仅兜底):不累计暴露
+            setpoints[seg.no] = None
+            continue
+        if budgeted:
+            candidates: set[float] = set()
+            for m in merged:
+                candidates.update((m.lo, m.hi))
+                for b in tracked:
+                    assert b.pref is not None
+                    for p in (b.pref.lo, b.pref.hi):
+                        if m.lo - EPS <= p <= m.hi + EPS:
+                            candidates.add(p)
+            best_t: float | None = None
+            best_obj = float("inf")
+            for t in sorted(candidates):
+                obj = max(
+                    (cum[b.no] + seg.hours * _dist_to_iv(t, b.pref)) / b.budget
+                    for b in budgeted
+                )
+                # 严格更优才替换:候选按温度升序遍历,平局自然保留较低温度
+                if obj < best_obj - EPS:
+                    best_obj, best_t = obj, t
+            setpoint = best_t
+        else:
+            widest = max(merged, key=lambda s: s.hi - s.lo)
+            setpoint = (widest.lo + widest.hi) / 2
+        setpoints[seg.no] = setpoint
+        assert setpoint is not None
+        for b in tracked:
+            assert b.pref is not None
+            cum[b.no] += seg.hours * _dist_to_iv(setpoint, b.pref)
+            if (
+                b.budget is not None
+                and cum[b.no] > b.budget + EPS
+                and b.no not in first_exceeded
+            ):
+                first_exceeded[b.no] = (seg, cum[b.no])
+    exposures = [
+        {
+            "batch": b,
+            "cumulative": cum[b.no],
+            "first_exceeded": first_exceeded[b.no][0] if b.no in first_exceeded else None,
+            "exceeded_cumulative": (
+                first_exceeded[b.no][1] if b.no in first_exceeded else None
+            ),
+        }
+        for b in tracked
+    ]
+    return {"ok": not first_exceeded, "setpoints": setpoints, "exposures": exposures}
 
 
 def _parse_zones(raw_zones: list[dict[str, Any]], ctx: str) -> list[_Zone]:
@@ -224,6 +330,32 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
         max_hours = None if mh in (None, "", 0, "0") else float(mh)
         if max_hours is not None and max_hours < 0:
             raise ValueError(f"货物 {name} 的最长运输时长不能为负数")
+        # 首选温度区间(可选,上下限需成对填写且落在允许温区内)
+        pref_lo_raw, pref_hi_raw = c.get("preferred_t_min"), c.get("preferred_t_max")
+        pref_lo = None if pref_lo_raw in (None, "") else float(pref_lo_raw)
+        pref_hi = None if pref_hi_raw in (None, "") else float(pref_hi_raw)
+        if (pref_lo is None) != (pref_hi is None):
+            raise ValueError(f"货物 {name} 的首选温度区间需同时填写下限与上限")
+        pref: _Iv | None = None
+        if pref_lo is not None and pref_hi is not None:
+            if pref_lo > pref_hi + EPS:
+                raise ValueError(f"货物 {name} 的首选温度下限高于上限")
+            if pref_lo < lo - EPS or pref_hi > hi + EPS:
+                raise ValueError(
+                    f"货物 {name} 的首选温度区间 [{_r(pref_lo)}, {_r(pref_hi)}]℃ "
+                    f"需落在允许温区 [{_r(lo)}, {_r(hi)}]℃ 内"
+                )
+            pref = _Iv(pref_lo, pref_hi)
+        # 最大度时预算(可选,0/留空视为不启用;启用时必须给出首选区间)
+        mb = c.get("max_degree_hours")
+        budget = None if mb in (None, "", 0, "0") else float(mb)
+        if budget is not None:
+            if budget < 0:
+                raise ValueError(f"货物 {name} 的度时预算不能为负数")
+            if pref is None:
+                raise ValueError(
+                    f"货物 {name} 填写了度时预算,需同时填写首选温度区间"
+                )
         batches.append(
             _Batch(
                 no=i + 1,
@@ -232,6 +364,8 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 unit_volume=unit_volume,
                 iv=_Iv(lo, hi),
                 max_hours=max_hours,
+                pref=pref,
+                budget=budget,
                 total_volume=_r(units * unit_volume),
             )
         )
@@ -288,13 +422,31 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             continue
 
+        # 2.5) 热暴露预算预检:独占一箱(可行区间最宽)仍超预算,则任何组合都不可行
+        if b.budget is not None:
+            solo = _simulate_exposure(segments, b.iv, [b])
+            if not solo["ok"]:
+                rec = solo["exposures"][0]
+                seg = rec["first_exceeded"]
+                add_unloaded(
+                    b,
+                    b.units,
+                    f"按逐段最优设定点,该批在运输段「{seg.name}」(第 {seg.no} 段,"
+                    f"{_r(seg.hours)}h)后累计热暴露 {_r(rec['exceeded_cumulative'])} "
+                    f"℃·h 超过度时预算 {_r(b.budget)} ℃·h;即使独占一箱"
+                    f"(可行温区最宽)仍超限,任何装箱组合均不可用",
+                    first_exceeded_segment_no=seg.no,
+                    first_exceeded_segment_name=seg.name,
+                )
+                continue
+
         # 3) 先尝试已有箱子(First-Fit)
         remaining = b.units
         unusable_boxes = 0
         for box in boxes:
             if remaining == 0:
                 break
-            if not box.can_take(b.iv):
+            if not box.can_take(b, b.iv):
                 unusable_boxes += 1
                 continue
             while remaining > 0 and box.try_load(b, b.iv):
@@ -320,7 +472,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                     remaining,
                     f"{compatible_note},"
                     f"但已达最大箱数 {max_boxes},现有 {len(boxes)} 个箱子"
-                    f"{'均无兼容温度或容量不足' if unusable_boxes else '容量不足'}",
+                    f"{'温度/热暴露预算不兼容或容量不足' if unusable_boxes else '容量不足'}",
                     tried_boxes=len(boxes),
                 )
                 break
@@ -335,7 +487,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 break
             box = _Box(index=len(boxes) + 1, capacity=box_capacity, segments=segments)
             if not box.try_load(b, b.iv):
-                # 理论上不可达(预检已保证逐段兼容),仅作兜底
+                # 理论上不可达(预检已保证逐段温区兼容且独占一箱不超预算),仅作兜底
                 failed = _first_failed_segment(segments, b.iv)
                 if segment_mode and failed is not None:
                     reason = (
@@ -362,6 +514,14 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
     loaded_volume = 0.0
     for box in boxes:
         assert box.feasible is not None
+        box_batches = list(box.batch_map.values())
+        # 箱内有填写首选温度区间的批次时,逐段设定点由热暴露模拟给出
+        # (含预算批次按"最大累计预算使用率最低"选取,否则沿用区间中点规则)
+        sim = (
+            _simulate_exposure(box.segments, box.feasible, box_batches)
+            if any(b.pref is not None for b in box_batches)
+            else None
+        )
         # 逐段校验:每段可设定温度 = 箱内货物共同交集 ∩ 该段各温区,再合并相邻段
         segment_checks: list[dict[str, Any]] = []
         envelope_raw: list[_Iv] = []
@@ -392,10 +552,14 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "recommended_setpoint": None,
             }
             if ok:
-                widest_seg = max(merged, key=lambda s: s.hi - s.lo)
-                check["recommended_setpoint"] = _r(
-                    (widest_seg.lo + widest_seg.hi) / 2
-                )
+                if sim is not None:
+                    # 热暴露模拟选定的本段设定点
+                    check["recommended_setpoint"] = _r(sim["setpoints"][seg.no])
+                else:
+                    widest_seg = max(merged, key=lambda s: s.hi - s.lo)
+                    check["recommended_setpoint"] = _r(
+                        (widest_seg.lo + widest_seg.hi) / 2
+                    )
                 envelope_raw.extend(merged)
             else:
                 transportable = False
@@ -423,6 +587,43 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                     "volume": _r(it.volume),
                 }
             )
+        # 热暴露结果:仅统计填写了首选温度区间的批次
+        exposure_out = None
+        if sim is not None:
+            exposure_items = []
+            for rec in sim["exposures"]:
+                eb = rec["batch"]
+                seg = rec["first_exceeded"]
+                cum_v = rec["cumulative"]
+                exposure_items.append(
+                    {
+                        "batch_no": eb.no,
+                        "name": eb.name,
+                        "preferred_t_min": _r(eb.pref.lo),
+                        "preferred_t_max": _r(eb.pref.hi),
+                        "cumulative_degree_hours": _r(cum_v),
+                        "budget_degree_hours": (
+                            _r(eb.budget) if eb.budget is not None else None
+                        ),
+                        "remaining_degree_hours": (
+                            _r(eb.budget - cum_v) if eb.budget is not None else None
+                        ),
+                        "utilization": (
+                            _r(cum_v / eb.budget) if eb.budget is not None else None
+                        ),
+                        "first_exceeded_segment_no": seg.no if seg else None,
+                        "first_exceeded_segment_name": seg.name if seg else None,
+                    }
+                )
+            exposure_out = {
+                "setpoint_strategy": (
+                    "budget_optimal"
+                    if any(b.budget is not None for b in box_batches)
+                    else "midpoint"
+                ),
+                "all_within_budget": sim["ok"],
+                "items": exposure_items,
+            }
         out_boxes.append(
             {
                 "box_no": box.index,
@@ -437,6 +638,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "matched_zones": matched_all,
                 "transportable": transportable,
                 "segment_checks": segment_checks,
+                "exposure": exposure_out,
                 "used_volume": _r(box.used),
                 "capacity": _r(box.capacity),
                 "utilization": _r(min(1.0, box.used / box.capacity)),
@@ -465,6 +667,7 @@ def plan(payload: dict[str, Any]) -> dict[str, Any]:
             "transport_hours": _r(transport_hours),
             "segment_mode": segment_mode,
             "all_transportable": all_transportable,
+            "heat_budget_enabled": any(b.budget is not None for b in batches),
         },
         "segments": [
             {
